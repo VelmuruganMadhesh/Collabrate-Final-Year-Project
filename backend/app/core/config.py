@@ -18,6 +18,10 @@ class Settings(BaseSettings):
     jwt_algorithm: str
     jwt_access_token_expire_minutes: int
 
+    # Logging
+    log_level: str = "INFO"
+    log_file: str | None = None
+
 
 def get_settings() -> Settings:
     return Settings()

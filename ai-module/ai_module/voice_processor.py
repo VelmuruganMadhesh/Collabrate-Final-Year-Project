@@ -1,11 +1,15 @@
 import base64
 import io
+import logging
 import os
 import re
 import tempfile
 from typing import Literal
 
 from gtts import gTTS
+
+
+logger = logging.getLogger(__name__)
 
 
 def _normalize_language(language: str) -> Literal["ta", "hi", "en"]:
@@ -28,10 +32,13 @@ def detect_intent(text: str, language: str) -> str:
 
     # Minimal keyword-based intent detection (production can be replaced by LLM classifier).
     if any(k in t for k in ["balance", "available", "amount", "account balance", "saldo", "balance amount"]):
+        logger.debug("Intent detected intent=balance language=%s", language)
         return "balance"
     if any(k in t for k in ["transaction", "transactions", "statement", "history", "last 5", "recent"]):
+        logger.debug("Intent detected intent=transactions language=%s", language)
         return "transactions"
     if any(k in t for k in ["transfer", "send", "payment", "pay"]):
+        logger.debug("Intent detected intent=transfer language=%s", language)
         return "transfer"
 
     # Very lightweight language hints (optional).
@@ -42,6 +49,7 @@ def detect_intent(text: str, language: str) -> str:
             return "balance"
         return "transactions"
 
+    logger.debug("Intent detected intent=general language=%s", language)
     return "general"
 
 
@@ -100,9 +108,11 @@ def maybe_generate_with_llm(*, prompt: str, language: str) -> str:
     """
     use_llm = (os.getenv("USE_LLM") or "").lower() == "true"
     if not use_llm:
+        logger.debug("LLM generation skipped")
         return ""
 
     model_name = os.getenv("HF_MODEL") or "google/flan-t5-small"
+    logger.info("LLM generation requested model=%s language=%s", model_name, language)
 
     try:
         # HuggingFace Transformers (lazy import)
@@ -114,9 +124,10 @@ def maybe_generate_with_llm(*, prompt: str, language: str) -> str:
             first = out[0] or {}
             text = first.get("generated_text")
             if text:
+                logger.info("LLM generation succeeded model=%s", model_name)
                 return str(text).strip()
     except Exception:
-        pass
+        logger.exception("LLM generation failed model=%s", model_name)
 
     # LangChain can be plugged in similarly; omitted in fallback path.
     return ""
@@ -124,12 +135,15 @@ def maybe_generate_with_llm(*, prompt: str, language: str) -> str:
 
 def synthesize_tts_mp3_base64(text: str, language: str) -> str:
     lang_code = _normalize_language(language)
+    logger.info("TTS synthesis started language=%s text_length=%s", lang_code, len(text))
     tts = gTTS(text=text, lang=lang_code)
     buf = io.BytesIO()
     # gTTS writes to file-like objects
     tts.write_to_fp(buf)
     buf.seek(0)
-    return base64.b64encode(buf.read()).decode("utf-8")
+    encoded = base64.b64encode(buf.read()).decode("utf-8")
+    logger.info("TTS synthesis completed language=%s audio_base64_length=%s", lang_code, len(encoded))
+    return encoded
 
 
 def transcribe_with_whisper(audio_bytes: bytes, *, language: str, audio_mime: str | None = None) -> str:
@@ -152,6 +166,12 @@ def transcribe_with_whisper(audio_bytes: bytes, *, language: str, audio_mime: st
         elif "mpeg" in audio_mime or "mp3" in audio_mime:
             suffix = ".mp3"
 
+    logger.info(
+        "Whisper transcription started language=%s audio_mime=%s audio_size=%s",
+        language,
+        audio_mime,
+        len(audio_bytes),
+    )
     with tempfile.NamedTemporaryFile(suffix=suffix, delete=True) as f:
         f.write(audio_bytes)
         f.flush()
@@ -161,7 +181,9 @@ def transcribe_with_whisper(audio_bytes: bytes, *, language: str, audio_mime: st
         whisper_lang = {"en": "en", "hi": "hi", "ta": "ta"}.get(lang_code, None)
         model = whisper.load_model(os.getenv("WHISPER_MODEL", "base"))
         result = model.transcribe(f.name, language=whisper_lang)
-        return _clean_text(result.get("text") or "")
+        transcript = _clean_text(result.get("text") or "")
+        logger.info("Whisper transcription completed language=%s transcript_length=%s", language, len(transcript))
+        return transcript
 
 
 async def process_voice_request(
@@ -174,6 +196,13 @@ async def process_voice_request(
     transcript_text: str | None,
 ):
     lang_code = _normalize_language(language)
+    logger.info(
+        "Voice processor started user_id=%s language=%s has_audio=%s has_transcript=%s",
+        user_id,
+        lang_code,
+        audio_bytes is not None,
+        bool(transcript_text),
+    )
 
     transcript = _clean_text(transcript_text or "")
     detected_intent = None
@@ -183,7 +212,7 @@ async def process_voice_request(
         try:
             transcript = transcribe_with_whisper(audio_bytes, language=lang_code, audio_mime=audio_mime)
         except Exception:
-            # Production: return a 4xx/5xx with actionable error.
+            logger.exception("Audio transcription failed user_id=%s language=%s", user_id, lang_code)
             transcript = ""
 
     if not transcript:
@@ -195,6 +224,7 @@ async def process_voice_request(
 
     # 2) Intent detection
     detected_intent = detect_intent(transcript, lang_code)
+    logger.info("Voice intent selected user_id=%s intent=%s", user_id, detected_intent)
 
     # 3) Fetch relevant data from MongoDB
     balance = None
@@ -204,6 +234,7 @@ async def process_voice_request(
         account = await accounts_col.find_one({"user_id": user_id})
         if account:
             balance = float(account.get("balance", 0.0))
+        logger.debug("Voice balance lookup user_id=%s found=%s", user_id, balance is not None)
     elif detected_intent == "transactions":
         tx_col = db["transactions"]
         cursor = (
@@ -221,12 +252,14 @@ async def process_voice_request(
             }
             for d in docs
         ]
+        logger.debug("Voice transaction lookup user_id=%s count=%s", user_id, len(transactions))
     else:
         # For general/transfer, we try to show balance as a default.
         accounts_col = db["accounts"]
         account = await accounts_col.find_one({"user_id": user_id})
         if account:
             balance = float(account.get("balance", 0.0))
+        logger.debug("Voice fallback account lookup user_id=%s found=%s", user_id, balance is not None)
 
     # 4) Generate response text (rule-based + optional LLM)
     base_text = build_response_text(
@@ -246,9 +279,11 @@ async def process_voice_request(
     llm_text = maybe_generate_with_llm(prompt=llm_prompt, language=lang_code)
     if llm_text:
         response_text = llm_text
+        logger.info("Voice response replaced by LLM user_id=%s", user_id)
 
     # 5) Text -> speech (gTTS)
     audio_base64 = synthesize_tts_mp3_base64(response_text, lang_code)
+    logger.info("Voice processor completed user_id=%s intent=%s", user_id, detected_intent)
 
     return {
         "text": response_text,

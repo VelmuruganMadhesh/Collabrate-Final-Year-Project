@@ -3,8 +3,12 @@ from typing import Optional
 from fastapi import HTTPException, status
 from bson import ObjectId
 
+from app.core.logging import get_logger, mask_email
 from app.core.security import hash_password, validate_password_rules
 from database.mongo import get_database
+
+
+logger = get_logger(__name__)
 
 
 async def create_user(
@@ -18,9 +22,11 @@ async def create_user(
 ) -> dict:
     validate_password_rules(password)
     users_col = db["users"]
+    safe_email = mask_email(email)
 
     existing = await users_col.find_one({"email": email})
     if existing:
+        logger.warning("Create user rejected reason=email_exists email=%s", safe_email)
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Email already registered.")
 
     doc = {
@@ -33,6 +39,7 @@ async def create_user(
     result = await users_col.insert_one(doc)
     user_id_str = str(result.inserted_id)
     doc["_id"] = user_id_str
+    logger.info("User document created user_id=%s email=%s", user_id_str, safe_email)
 
     # Create a default account record for the new user (demo-friendly).
     accounts_col = db["accounts"]
@@ -46,6 +53,7 @@ async def create_user(
             "created_at": None,
         }
     )
+    logger.info("Default account created user_id=%s account_number=%s", user_id_str, account_number)
 
     # Remove sensitive fields
     doc.pop("password_hash", None)
@@ -54,7 +62,9 @@ async def create_user(
 
 async def get_user_by_email(db, email: str) -> Optional[dict]:
     users_col = db["users"]
-    return await users_col.find_one({"email": email})
+    user = await users_col.find_one({"email": email})
+    logger.debug("User lookup by email email=%s found=%s", mask_email(email), bool(user))
+    return user
 
 
 def to_user_public(user_doc: dict) -> dict:

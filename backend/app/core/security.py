@@ -9,9 +9,11 @@ from passlib.context import CryptContext
 from bson import ObjectId
 
 from app.core.config import get_settings
+from app.core.logging import get_logger
 from database.mongo import get_database
 
 
+logger = get_logger(__name__)
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/auth/login")
@@ -27,12 +29,16 @@ def verify_password(password: str, password_hash: str) -> bool:
 
 def validate_password_rules(password: str) -> None:
     if len(password) < 8:
+        logger.warning("Password validation failed reason=too_short")
         raise ValueError("Password must be at least 8 characters long.")
     if not re.search(r"[A-Z]", password):
+        logger.warning("Password validation failed reason=missing_uppercase")
         raise ValueError("Password must contain at least one uppercase letter.")
     if not re.search(r"[a-z]", password):
+        logger.warning("Password validation failed reason=missing_lowercase")
         raise ValueError("Password must contain at least one lowercase letter.")
     if not re.search(r"[0-9]", password):
+        logger.warning("Password validation failed reason=missing_number")
         raise ValueError("Password must contain at least one number.")
 
 
@@ -55,17 +61,22 @@ async def get_current_user(
         payload = jwt.decode(token, settings.jwt_secret_key, algorithms=[settings.jwt_algorithm])
         user_id = payload.get("sub")
         if not user_id:
+            logger.warning("Token rejected reason=missing_subject")
             raise HTTPException(status_code=401, detail="Invalid token.")
     except JWTError:
+        logger.warning("Token rejected reason=jwt_error")
         raise HTTPException(status_code=401, detail="Invalid token.")
 
     try:
         user_obj_id = ObjectId(user_id)
     except Exception:
+        logger.warning("Token rejected reason=invalid_subject user_id=%s", user_id)
         raise HTTPException(status_code=401, detail="Invalid token subject.")
 
     user = await users_col.find_one({"_id": user_obj_id})
     if not user:
+        logger.warning("Token user not found user_id=%s", user_id)
         raise HTTPException(status_code=401, detail="User not found.")
+    logger.debug("Current user loaded user_id=%s", user_id)
     return user
 
